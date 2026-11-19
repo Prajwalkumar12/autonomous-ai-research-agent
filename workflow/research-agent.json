@@ -1,0 +1,707 @@
+{
+  "name": "Autonomous AI Research Agent - Ollama + Tavily + Memory",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {
+          "allowFileUploads": false
+        }
+      },
+      "id": "0ae54024-2c41-448c-a638-a5b06276a0d7",
+      "name": "Research Chat Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        16,
+        -16
+      ],
+      "webhookId": "research-agent-chat-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst query = String(input.chatInput ?? input.text ?? input.message ?? '').trim();\nif (!query) throw new Error('Please enter a research topic.');\nreturn [{json: {userQuery: query, startedAt: new Date().toISOString()}}];"
+      },
+      "id": "b37156cf-3109-4ef4-8bb7-3299c32f21c1",
+      "name": "Validate Research Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-CLOUDFLARE-TUNNEL-URL/api/chat",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: \"qwen3:1.7b\", stream: false, format: \"json\",\n  messages: [\n    { role: \"system\", content: \"You are a research planner. Generate exactly 3 distinct web search queries. Use previous research history only to avoid repeating old searches and identify useful gaps. Return only valid JSON with research_goal and queries fields.\" },\n    { role: \"user\", content: \"Current research request: \" + $(\"Validate Research Query\").first().json.userQuery + \"\\\\n\\\\nPrevious research history (may be empty): \" + JSON.stringify($items(\"Load Previous Research Memory\").map(i => ({researchQuery:i.json.researchQuery, generatedAt:i.json.generatedAt})).slice(0,5)) }\n  ]\n}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "813b49b8-5f33-49af-89d0-0c086a1e5468",
+      "name": "Ollama - Create Research Plan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        464,
+        -16
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst raw = $input.first().json;\n\n// Read Ollama response\nlet content = raw.message?.content;\n\nif (!content) {\n  throw new Error(\"Ollama returned no planning content.\");\n}\n\n// Parse JSON returned by Qwen\nlet plan;\n\ntry {\n  plan = JSON.parse(content);\n} catch (error) {\n  const match = content.match(/\\{[\\s\\S]*\\}/);\n\n  if (!match) {\n    throw new Error(\"Planner returned invalid JSON: \" + content.slice(0, 500));\n  }\n\n  plan = JSON.parse(match[0]);\n}\n\nconst queries = Array.isArray(plan.queries)\n  ? plan.queries.map(q => String(q).trim()).filter(Boolean).slice(0, 5)\n  : [];\n\nif (queries.length === 0) {\n  throw new Error(\"Planner returned no search queries.\");\n}\n\nreturn queries.map((query, index) => ({\n  json: {\n    query,\n    queryIndex: index + 1,\n    researchGoal: plan.research_goal || \"Research task\"\n  }\n}));\n"
+      },
+      "id": "2abbb603-de89-49ce-a2f0-85147b1e0d72",
+      "name": "Parse Plan into Search Tasks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.tavily.com/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "=\n{{ JSON.stringify({\n  query: $json.query,\n  search_depth: \"basic\",\n  max_results: 5,\n  include_answer: false,\n  include_raw_content: false\n}) }}\n",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "id": "ffcd330f-6794-47bf-8903-95de28715b07",
+      "name": "Tavily - Search Web",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        896,
+        -16
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "4lKzznON9hg47tFC",
+          "name": "Header Auth account 3"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst seen = new Set();\nconst sources = [];\nconst failures = [];\nfor (const item of items) {\n  const data = item.json ?? {};\n  if (data.error || data.statusCode >= 400) { failures.push(String(data.error?.message ?? data.message ?? 'Search request failed')); continue; }\n  const results = Array.isArray(data.results) ? data.results : (Array.isArray(data.body?.results) ? data.body.results : []);\n  for (const r of results) {\n    const url = String(r.url ?? '').trim();\n    if (!url || seen.has(url)) continue;\n    seen.add(url);\n    sources.push({title: r.title ?? '', url, content: r.content ?? r.raw_content ?? '', score: r.score ?? null});\n  }\n}\nif (!sources.length) throw new Error('No usable web results were returned. Check Tavily API key, query and connectivity. ' + failures.join(' | '));\nreturn [{json: {sources, sourceCount: sources.length, failedSearches: failures}}];"
+      },
+      "id": "da8b11e4-8322-4c07-a482-a4aeabbfa313",
+      "name": "Deduplicate and Aggregate Sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-CLOUDFLARE-TUNNEL-URL/api/chat",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({\n  model: 'qwen3:1.7b',\n  stream: false,\n  options: {\n    temperature: 0.2,\n    num_predict: 1800\n  },\n  messages: [\n    {\n      role: 'system',\n      content: '/no_think You are an evidence-focused research analyst. Use only supplied sources. Do not invent facts or citations. Write a complete Markdown report with Executive Summary, Research Plan, Key Findings, Important Evidence, Actionable Insights, Limitations, and Sources. Include full source URLs. Target 800-1000 words.'\n    },\n    {\n      role: 'user',\n      content: 'Research goal: ' +\n        $('Validate Research Query').first().json.userQuery +\n        '\\n\\nSources:\\n' +\n        JSON.stringify(($json.sources || []).slice(0, 5).map(s => ({\n          title: s.title,\n          url: s.url,\n          content: String(s.content || '').slice(0, 900)\n        })))\n    }\n  ]\n}) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 300000
+        }
+      },
+      "id": "4ae92536-8f41-4452-a0e5-87a0fcf3626c",
+      "name": "Ollama - Analyze and Write Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1408,
+        -128
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst report = data.message?.content ?? data.body?.message?.content ?? data.data?.message?.content ?? data.response ?? '';\nif (!report) throw new Error('Ollama did not return a report. Check endpoint and model availability.');\nconst original = $('Validate Research Query').first().json;\nconst aggregate = $('Deduplicate and Aggregate Sources').first().json;\nreturn [{json: {status: 'completed', researchQuery: original.userQuery, generatedAt: new Date().toISOString(), sourceCount: aggregate.sourceCount, reportMarkdown: String(report).trim(), sources: aggregate.sources, failedSearches: aggregate.failedSearches}}];"
+      },
+      "id": "9fdada52-f203-4527-af5b-8f32cf1e01f6",
+      "name": "Format Final Research Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1584,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "iGzSbxftMq9sdbpI",
+          "mode": "list",
+          "cachedResultName": "ResearchMemory",
+          "cachedResultUrl": "/projects/DH8LfygWpR5SmwPZ/datatables/iGzSbxftMq9sdbpI"
+        },
+        "matchType": "allConditions",
+        "filters": {
+          "conditions": []
+        },
+        "limit": 5
+      },
+      "id": "ddac52da-7dae-4b6e-aa49-0857eb7b3ce1",
+      "name": "Load Previous Research Memory",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        352,
+        224
+      ],
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const a=$input.first().json; const sources=Array.isArray(a.sources)?a.sources:[]; const urls=sources.slice(0,5).map(s=>s.url).filter(Boolean); if(!urls.length) throw new Error('No URLs available for webpage extraction.'); return [{json:{sources,sourceCount:a.sourceCount,failedSearches:a.failedSearches||[],urls}}];"
+      },
+      "id": "d81eacbe-6eff-4df8-8c7a-7296e6b67ddc",
+      "name": "Prepare URLs for Webpage Extraction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1312,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.tavily.com/extract",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ urls: $json.urls, extract_depth: 'basic', include_images: false }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "id": "8c7d93ea-dde4-498d-82b9-5c11cf44ec99",
+      "name": "Tavily - Extract Webpage Content",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1600,
+        -176
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "4lKzznON9hg47tFC",
+          "name": "Header Auth account 3"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const response=$input.first().json??{}; const base=$('Prepare URLs for Webpage Extraction').first().json; const extracted=Array.isArray(response.results)?response.results:(Array.isArray(response.body?.results)?response.body.results:[]); const byUrl=new Map(extracted.map(r=>[String(r.url||'').trim(),r])); const failed=Array.isArray(response.failed_results)?response.failed_results:(Array.isArray(response.body?.failed_results)?response.body.failed_results:[]); const sources=(base.sources||[]).map(s=>{const full=byUrl.get(String(s.url||'').trim()); return {...s,content:String(full?.raw_content||full?.content||s.content||'').slice(0,1800),extractionStatus:full?'extracted':'search_snippet_fallback'};}); return [{json:{sources,sourceCount:base.sourceCount,failedSearches:base.failedSearches||[],extractionFailures:failed,extractedCount:sources.filter(s=>s.extractionStatus==='extracted').length}}];"
+      },
+      "id": "edefce9d-4bfc-4c8c-b99c-71c1b0d78615",
+      "name": "Merge Extracted Webpage Content",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst r = $input.first().json;\n\nconst report = String(r.reportMarkdown || '');\n\nconst required = [\n  'Executive Summary',\n  'Research Plan',\n  'Key Findings',\n  'Important Evidence',\n  'Actionable Insights',\n  'Limitations',\n  'Sources'\n];\n\nconst missingSections = required.filter(\n  h => !report.toLowerCase().includes(h.toLowerCase())\n);\n\nconst citationCount = report.split('[').length - 1;\n\nconst sourceLinks =\n  (report.split('https://').length - 1) +\n  (report.split('http://').length - 1);\n\nconst passed =\n  missingSections.length === 0 &&\n  sourceLinks > 0 &&\n  report.length > 500;\n\nreturn [{\n  json: {\n    ...r,\n    qualityCheck: {\n      passed,\n      missingSections,\n      citationCount,\n      sourceLinks,\n      reportCharacters: report.length,\n      note: passed\n        ? 'Required sections and source links detected.'\n        : 'Report may be incomplete. Check missing sections and source links.'\n    }\n  }\n}];\n"
+      },
+      "id": "46f8668c-689d-41c2-9178-775197cbab7a",
+      "name": "Research Quality Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2384,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "value": "iGzSbxftMq9sdbpI",
+          "mode": "list",
+          "cachedResultName": "ResearchMemory",
+          "cachedResultUrl": "/projects/DH8LfygWpR5SmwPZ/datatables/iGzSbxftMq9sdbpI"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "researchQuery": "={{ $json.researchQuery }}",
+            "generatedAt": "={{ $json.generatedAt }}",
+            "sourceCount": "={{ $json.sourceCount }}",
+            "reportMarkdown": "={{ $json.reportMarkdown }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "researchQuery",
+              "displayName": "researchQuery",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "generatedAt",
+              "displayName": "generatedAt",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "sourceCount",
+              "displayName": "sourceCount",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "reportMarkdown",
+              "displayName": "reportMarkdown",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "d33f52c3-b508-4576-bbd5-dd95484fa034",
+      "name": "Save Research Memory",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2608,
+        -16
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const final=$('Research Quality Check').first().json; const write=$input.first()?.json??{}; return [{json:{...final,memory:{table:'ResearchMemory',saved:!write.error,note:write.error?'Memory write did not complete; check the ResearchMemory table and columns.':'Research run stored for future context.'}}}];"
+      },
+      "id": "fcb7e773-8a1b-42f2-a755-b8598b7dc17d",
+      "name": "Return Final Output with Memory Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2832,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://en.wikipedia.org/w/api.php",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "action",
+              "value": "query"
+            },
+            {
+              "name": "list",
+              "value": "search"
+            },
+            {
+              "name": "srsearch",
+              "value": "={{ $json.query }}"
+            },
+            {
+              "name": "srlimit",
+              "value": "3"
+            },
+            {
+              "name": "format",
+              "value": "json"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "43e25f6d-72a5-4b3a-8757-271a39bda3d8",
+      "name": "Wikipedia - Search Knowledge Base",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        896,
+        224
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1500,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const d=$input.first().json??{}; const hits=d.query?.search||d.body?.query?.search||[]; const results=hits.map(h=>({title:h.title,url:'https://en.wikipedia.org/wiki/'+encodeURIComponent(h.title.replace(/ /g,'_')),content:String(h.snippet||'').replace(/<[^>]*>/g,' ').replace(/&quot;/g,'\"').replace(/&#039;/g,\"'\").replace(/&amp;/g,'&'),score:null,sourceTool:'Wikipedia'})); return [{json:{results}}];"
+      },
+      "id": "011fadaf-2fb6-4b51-ae56-7de25973b524",
+      "name": "Normalize Wikipedia Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        224
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "d8f395a6-53a5-4b7a-b17c-52467eaa965d",
+      "name": "Merge Tavily + Wikipedia Results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1344,
+        144
+      ]
+    },
+    {
+      "parameters": {
+        "html_content": "={{ \n`<html>\n<head>\n<style>\nbody {\n  font-family: Arial, sans-serif;\n  padding: 35px;\n  color: #222;\n  line-height: 1.6;\n}\nh1 {\n  color: #17365D;\n}\npre {\n  white-space: pre-wrap;\n  overflow-wrap: break-word;\n  font-family: Arial, sans-serif;\n  font-size: 12px;\n}\n</style>\n</head>\n<body>\n<h1>AI Research Report</h1>\n<h2>${$json.researchQuery}</h2>\n<p>Generated: ${$json.generatedAt}</p>\n<p>Total Sources: ${$json.sourceCount}</p>\n<hr>\n<pre>${String($json.reportMarkdown || '')\n.replace(/&/g, '&amp;')\n.replace(/</g, '&lt;')\n.replace(/>/g, '&gt;')}</pre>\n</body>\n</html>`\n}}"
+      },
+      "type": "n8n-nodes-htmlcsstopdf.htmlcsstopdf",
+      "typeVersion": 1,
+      "position": [
+        3056,
+        -16
+      ],
+      "id": "4bf61d52-8ad8-404b-b280-cb90877e1727",
+      "name": "Convert HTML to PDF",
+      "credentials": {
+        "htmlcsstopdfApi": {
+          "id": "DP25v3bVQextFfRO",
+          "name": "HTML to PDF account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Research Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "Validate Research Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Research Query": {
+      "main": [
+        [
+          {
+            "node": "Load Previous Research Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama - Create Research Plan": {
+      "main": [
+        [
+          {
+            "node": "Parse Plan into Search Tasks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Plan into Search Tasks": {
+      "main": [
+        [
+          {
+            "node": "Tavily - Search Web",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Wikipedia - Search Knowledge Base",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tavily - Search Web": {
+      "main": [
+        [
+          {
+            "node": "Merge Tavily + Wikipedia Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deduplicate and Aggregate Sources": {
+      "main": [
+        [
+          {
+            "node": "Prepare URLs for Webpage Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama - Analyze and Write Report": {
+      "main": [
+        [
+          {
+            "node": "Format Final Research Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Previous Research Memory": {
+      "main": [
+        [
+          {
+            "node": "Ollama - Create Research Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare URLs for Webpage Extraction": {
+      "main": [
+        [
+          {
+            "node": "Tavily - Extract Webpage Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tavily - Extract Webpage Content": {
+      "main": [
+        [
+          {
+            "node": "Merge Extracted Webpage Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Extracted Webpage Content": {
+      "main": [
+        [
+          {
+            "node": "Ollama - Analyze and Write Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Final Research Output": {
+      "main": [
+        [
+          {
+            "node": "Research Quality Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Research Quality Check": {
+      "main": [
+        [
+          {
+            "node": "Save Research Memory",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Research Memory": {
+      "main": [
+        [
+          {
+            "node": "Return Final Output with Memory Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wikipedia - Search Knowledge Base": {
+      "main": [
+        [
+          {
+            "node": "Normalize Wikipedia Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Wikipedia Results": {
+      "main": [
+        [
+          {
+            "node": "Merge Tavily + Wikipedia Results",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Tavily + Wikipedia Results": {
+      "main": [
+        [
+          {
+            "node": "Deduplicate and Aggregate Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Return Final Output with Memory Status": {
+      "main": [
+        [
+          {
+            "node": "Convert HTML to PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": true
+  },
+  "versionId": "5bd893b5-8d33-4696-b85f-d9392fba5021",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "bddce26a01084c91f8de7949551d67d9be4117bea5bfb0efb134e2ef92e64aa9"
+  },
+  "nodeGroups": [],
+  "id": "LvM72FKIXaRRg7mp",
+  "tags": []
+}
